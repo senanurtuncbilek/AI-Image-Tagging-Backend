@@ -7,6 +7,7 @@ import os
 import time
 import logging
 from collections import Counter
+from werkzeug.utils import secure_filename
 
 # Logging yapılandırması
 logging.basicConfig(
@@ -18,11 +19,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# YOLO detector instance
+VALID_TOKEN = "1234567890987654321"
+
 detector = None
 
 def init_detector():
-    """YOLO detector'ı başlat"""
     global detector
     try:
         logger.info("YOLO detector başlatılıyor...")
@@ -38,134 +39,70 @@ def before_request():
     if detector is None:
         init_detector()
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'ok',
-        'service': 'python-ai',
-        'model_loaded': detector is not None,
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-    })
-
 @app.route('/process', methods=['POST'])
 def process_image():
-    """
-    Resim analizi endpoint'i
+    # --- GÜVENLİK KONTROLÜ (BEARER TOKEN) ---
+    auth_header = request.headers.get('Authorization')
     
-    Request body:
-    {
-        "image_path": "uploads/abc-123.jpg",
-        "options": {
-            "confidence_threshold": 0.5,
-            "max_objects": 50
-        }
-    }
-    """
-    start_time = time.time()
+    if not auth_header or not auth_header.startswith('Bearer '):
+        logger.warning("Yetkisiz erişim denemesi: Token bulunamadı.")
+        return jsonify({'success': False, 'error': 'Bearer token gerekli!'}), 401
     
-    try:
-        data = request.get_json()
-        
-        if not data or 'image_path' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'image_path parametresi gerekli'
-            }), 400
-        
-        image_path = data['image_path']
-        options = data.get('options', {})
-        confidence_threshold = options.get('confidence_threshold', Config.CONFIDENCE_THRESHOLD)
-        max_objects = options.get('max_objects', Config.MAX_OBJECTS)
-        
+    token = auth_header.split(" ")[1]
+    if token != VALID_TOKEN:
+        logger.warning(f"Geçersiz token denemesi: {token}")
+        return jsonify({'success': False, 'error': 'Geçersiz yetki!'}), 401
+    # ---------------------------------------
 
-        if not os.path.isabs(image_path):
-            # Eğer path zaten uploads/ ile başlıyorsa bir üst dizine çık
-            if image_path.startswith('uploads/'):
-                image_path = os.path.join('..', image_path)
-            else:
-                # Direkt path ise uploads/ ekle
-                image_path = os.path.join('..', 'uploads', os.path.basename(image_path))
+    start_time = time.time()
+    try:
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': 'Resim dosyası yüklenmedi'}), 400
         
-        logger.info(f"Resim analizi başlatılıyor: {image_path}")
+        file = request.files['image']
+        temp_dir = 'temp_uploads'
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+            
+        filename = secure_filename(file.filename)
+        temp_path = os.path.join(temp_dir, filename)
+        file.save(temp_path)
         
-        # Dosya var mı kontrol et
-        if not os.path.exists(image_path):
-            return jsonify({
-                'success': False,
-                'error': f'Resim dosyası bulunamadı: {image_path}'
-            }), 404
+        results = detector.detect(temp_path, confidence=Config.CONFIDENCE_THRESHOLD)
         
-        # YOLO ile tespit
-        results = detector.detect(image_path, confidence=confidence_threshold)
-        
-        # Sonuçları işle
-        object_counts = {}
         all_detections = []
-        
         for result in results:
             boxes = result.boxes
             if boxes is not None:
                 for box in boxes:
                     class_id = int(box.cls[0])
-                    class_name = result.names[class_id]
-                    confidence = float(box.conf[0])
-                    
                     all_detections.append({
-                        'class': class_name,
-                        'confidence': confidence
+                        'class': result.names[class_id],
+                        'confidence': float(box.conf[0])
                     })
         
-        # Obje sayılarını hesapla
         class_counter = Counter([det['class'] for det in all_detections])
         object_counts = dict(class_counter)
-        
-        # Max object limiti
-        if len(all_detections) > max_objects:
-            logger.warning(f"Çok fazla obje tespit edildi ({len(all_detections)}). Limit: {max_objects}")
-            # En yüksek confidence olanları al
-            sorted_detections = sorted(all_detections, key=lambda x: x['confidence'], reverse=True)
-            all_detections = sorted_detections[:max_objects]
-            # Yeniden say
-            class_counter = Counter([det['class'] for det in all_detections])
-            object_counts = dict(class_counter)
-        
-        # Ortalama confidence
         avg_confidence = sum([det['confidence'] for det in all_detections]) / len(all_detections) if all_detections else 0
-        
-        # Keywords üret
         keywords = generate_keywords(object_counts)
         
-        processing_time = time.time() - start_time
-        
-        response = {
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        return jsonify({
             'success': True,
             'object_counts': object_counts,
             'keywords': keywords,
             'total_objects': len(all_detections),
             'confidence': round(avg_confidence, 2),
-            'processing_time': round(processing_time, 2),
+            'processing_time': round(time.time() - start_time, 2),
             'model_version': 'YOLOv8n'
-        }
-        
-        logger.info(f"Analiz tamamlandı: {len(all_detections)} obje tespit edildi, {processing_time:.2f}s")
-        
-        return jsonify(response)
+        })
         
     except Exception as e:
         logger.error(f"İşleme hatası: {str(e)}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': f'İşleme hatası: {str(e)}'
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # İlk başlatmada modeli yükle
-    try:
-        init_detector()
-        logger.info(f"Python AI Service başlatılıyor: http://{Config.FLASK_HOST}:{Config.FLASK_PORT}")
-        app.run(host=Config.FLASK_HOST, port=Config.FLASK_PORT, debug=Config.DEBUG)
-    except Exception as e:
-        logger.error(f"Servis başlatılamadı: {str(e)}")
-        raise
-
+    init_detector()
+    app.run(host=Config.FLASK_HOST, port=Config.FLASK_PORT, debug=Config.DEBUG)
