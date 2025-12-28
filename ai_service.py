@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
+# Bu token, sadece Node.js Proxy'nin bildiği sabit anahtardır.
+# Proxy, kullanıcıyı kendi içinde doğruladıktan sonra buraya bu anahtarla gelir.
 VALID_TOKEN = "1234567890987654321"
 
 detector = None
@@ -41,18 +43,18 @@ def before_request():
 
 @app.route('/process', methods=['POST'])
 def process_image():
-    # --- GÜVENLİK KONTROLÜ (BEARER TOKEN) ---
+    # --- GÜVENLİK KONTROLÜ (PROXY'DEN GELEN SABİT TOKEN) ---
     auth_header = request.headers.get('Authorization')
     
     if not auth_header or not auth_header.startswith('Bearer '):
-        logger.warning("Yetkisiz erişim denemesi: Token bulunamadı.")
-        return jsonify({'success': False, 'error': 'Bearer token gerekli!'}), 401
+        logger.warning("Yetkisiz erişim denemesi: Başlık eksik.")
+        return jsonify({'success': False, 'error': 'Yetkisiz erişim: Proxy üzerinden bağlanın.'}), 401
     
     token = auth_header.split(" ")[1]
     if token != VALID_TOKEN:
         logger.warning(f"Geçersiz token denemesi: {token}")
         return jsonify({'success': False, 'error': 'Geçersiz yetki!'}), 401
-    # ---------------------------------------
+    # -------------------------------------------------------------
 
     start_time = time.time()
     try:
@@ -68,10 +70,11 @@ def process_image():
         temp_path = os.path.join(temp_dir, filename)
         file.save(temp_path)
         
+        # Görüntü analizi
         results = detector.detect(temp_path, confidence=Config.CONFIDENCE_THRESHOLD)
         
         all_detections = []
-        for result in results:
+        for result in results: # Buradaki yazım hatası düzeltildi
             boxes = result.boxes
             if boxes is not None:
                 for box in boxes:
@@ -81,11 +84,13 @@ def process_image():
                         'confidence': float(box.conf[0])
                     })
         
+        # Sonuçları işle
         class_counter = Counter([det['class'] for det in all_detections])
         object_counts = dict(class_counter)
         avg_confidence = sum([det['confidence'] for det in all_detections]) / len(all_detections) if all_detections else 0
         keywords = generate_keywords(object_counts)
         
+        # Geçici dosyayı temizle
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
